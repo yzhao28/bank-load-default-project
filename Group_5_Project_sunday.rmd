@@ -1,0 +1,303 @@
+---
+title: "Group 5 Credit Default Project"
+date: "April 3, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load packages and data; test data for all three scenarios are the same, other than the extra column, only loading last test set
+
+```{r}
+rm(list=ls())
+set.seed(789)
+library(caret)
+library(plyr)
+library(dplyr)
+#library(mice)
+#library(DMwR)
+#library(missForest)
+#library(xgboost)
+#library(parallel)
+#library(parallelMap)
+library(tidyr)
+library(readr)
+library(pROC)
+#library(randomForest)
+#library(kernlab)
+#library(gbm)
+#library(mlr)
+library(glmnet)
+library(glmnetUtils)
+#library(leaps)
+#library(bestglm)
+#library(olsrr)
+#library(mlbench)
+inputdata <- read.csv("train_v3.csv")
+data <- inputdata
+
+finaltest <- read.csv("test_scenario3.csv")
+finaltest <- finaltest[ ,-1]
+#cm12 <- colMeans(is.na(finaltest12))
+#summary(cm12)
+#cm3 <- colMeans(is.na(finaltest3))
+#summary(cm3)
+# testing data appears to be missing similar proportion of data as training data
+# also test data has additional first col of ascending numbers that should be removed
+```
+
+### Convert loss (0-100) scale to proportion repaid (0-1) scale
+
+```{r}
+inputdata$proportion_repaid <- (100 - inputdata$loss)/100
+inputdata <- inputdata[ ,-763]
+class(inputdata[ ,763])
+data$proportion_repaid <- (100 - data$loss)/100
+data <- data[ ,-763]
+class(data[ ,763])
+```
+
+### Create factor for no default, in this case we are not treating default as the positive case; should not be an issue as long as everything is consistent
+
+```{r}
+for (i in 1:nrow(data)) {
+  if (data[i, "proportion_repaid"] !=1 ) {
+  data[i, "no_def"] <- 0
+  } else {
+    data[i, "no_def"] <- 1
+  }
+}
+data$no_def <- as.factor(data$no_def)
+class(data$no_def)
+levels(data$no_def)
+summary(data$no_def)
+head(data$no_def)
+inputdata$no_def <- data$no_def
+class(inputdata$no_def)
+levels(inputdata$no_def)
+summary(inputdata$no_def)
+head(inputdata$no_def)
+```
+
+### Identify complete cases for variable selection
+
+```{r}
+na_rowmeans <- rowMeans(is.na(data))
+complete_indices <- which(na_rowmeans==0)
+length(complete_indices)
+lasso_vs_labels <- data[complete_indices,764]
+data <- as.matrix(data[complete_indices,1:762])
+rm(na_rowmeans)
+```
+
+### Perform cross validation of lasso regression on complete cases for variable selection
+
+```{r}
+set.seed(789)
+lasso_vs_folds <- createFolds(lasso_vs_labels, k=5, list=FALSE)
+lasso_vs_cv <- cv.glmnet(data, lasso_vs_labels, foldid=lasso_vs_folds, alpha=1, standardize=TRUE, family="binomial", type.measure="auc")
+```
+
+### Identify coefficients corresponding to lambda.1se and save corresponding indices, note y intercept is provided so each index corresponding to a non-zero coefficient must be reduced by one to correspond to the proper column in our data set; lambda.1se chosen over lambda.min by running each with xgb and comparing results, the smaller amount of variables yielded a greater auc
+
+```{r}
+lasso_vs_ind <- c()
+lasso_vs_coef <- coef(lasso_vs_cv,s="lambda.1se")
+lasso_vs_coef <- as.matrix(lasso_vs_coef)
+lasso_vs_coef <- as.vector(lasso_vs_coef)
+for (i in 2:length(lasso_vs_coef)) {
+  if (lasso_vs_coef[i]!=0) {
+    lasso_vs_ind <- c(lasso_vs_ind, i-1)
+  }
+}
+length(lasso_vs_ind)
+plot(lasso_vs_cv)
+```
+
+### Impute missing values for selected variables for classification; did not combine train and test for realistic test of model accuracy
+
+```{r}
+data <- inputdata[ ,lasso_vs_ind]
+testdata <- finaltest[ ,lasso_vs_ind]
+```
+
+
+```{r}
+knn_class_model <- preProcess(x=data, method=c("knnImpute","zv","nzv"), k=4, verbose=TRUE)
+data_imp <- predict(knn_class_model, data)
+finaltestdata_imp <- predict(knn_class_model, testdata)
+rm(testdata)
+data <- data_imp
+```
+
+### GLM; use caret to create stratified folds that can be reused for model comparison; tune model for optimal alpha
+
+```{r}
+set.seed(789)
+class_index <- createDataPartition(inputdata$no_def, p=0.8, list=FALSE)
+data_train <- as.matrix(data_imp[class_index, ])
+data_test <- as.matrix(data_imp[-class_index, ])
+data_train_labels <- inputdata[class_index,764]
+data_test_labels <- inputdata[-class_index,764]
+class_folds <- createFolds(data_train_labels,k=4,list=FALSE)
+class_cva <- cva.glmnet(data_train, data_train_labels, foldid=class_folds, alpha=c(0.8558,0.8564,0.8572), standardize=FALSE, family="binomial", type.measure="auc", nlambda=100)
+minlossplot(class_cva)
+```
+
+### Once optimal lambda is determined, use cv to tune for lambda yielding maximum auc
+
+```{r}
+class_cv <- cv.glmnet(data_train, data_train_labels, foldid=class_folds, alpha=0.8564, standardize=FALSE, family="binomial", type.measure="auc", nlambda=200)
+i_class_lam_min <- which(class_cv$lambda == class_cv$lambda.min)
+class_max_auc <- class_cv$cvm[i_class_lam_min]
+class_max_auc
+```
+
+### Predict test data and test auc
+
+```{r}
+class_glm_test_predictions <- predict(class_cv, newx=data_test, s="lambda.min", type="response")
+roc(data_test_labels, as.vector(class_glm_test_predictions))
+```
+
+### Look at probability distribution of defaults (level 0); a wider probability spread among the predictions for actual defaulters is desired; this along with auc is decision criteria for optimal classification model
+
+```{r}
+summary(class_glm_test_predictions)
+```
+
+
+```{r}
+class_glm_test_predictions_labeled <- ifelse(class_glm_test_predictions >= 0.733,"1","0")
+confusionMatrix(as.factor(class_glm_test_predictions_labeled), data_test_labels)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### LASSO VS for regression via default data; select only defaulted samples; need for this was clarified as variable selection with 50/50 mix of defaulters and non-defaulters yielded all zero coefficients, other than beta 0
+
+```{r}
+set.seed(789)
+data <- inputdata[complete_indices, ]
+data %>% filter(no_def=="0") -> data_def
+data_def_labels <- data_def$proportion_repaid*100
+data_def <- as.matrix(data_def[ ,1:762])
+```
+
+
+```{r}
+lasso_regvs_folds <- createFolds(data_def_labels, k=5, list=FALSE)
+```
+
+
+```{r}
+lasso_regvs_cv <- cv.glmnet(data_def, data_def_labels, foldid=lasso_regvs_folds, alpha=1, standardize=TRUE, family="gaussian", type.measure="mae")
+rm(data_def,data_def_labels)
+```
+
+### Extract non-zero variable indices
+
+```{r}
+lasso_regvs_ind <- c()
+lasso_regvs_coef <- coef(lasso_regvs_cv,s="lambda.min")
+lasso_regvs_coef<- as.matrix(lasso_regvs_coef)
+lasso_regvs_coef<- as.vector(lasso_regvs_coef)
+for (i in 2:length(lasso_regvs_coef)) {
+  if (lasso_regvs_coef[i]!=0) {
+    lasso_regvs_ind <- c(lasso_regvs_ind, i-1)
+  }
+}
+length(lasso_regvs_ind)
+plot(lasso_regvs_cv)
+```
+
+### Impute missing values for selected regression variables and only defaulted samples; again not including the test data in the imputation model
+
+```{r}
+data <- inputdata
+data %>% filter(no_def=="0") -> data
+data <- data[ ,lasso_regvs_ind]
+testdata <- finaltest[ ,lasso_regvs_ind]
+```
+
+
+```{r}
+knn_reg_model <- preProcess(x=data, method=c("knnImpute","zv","nzv"), k=4, verbose=TRUE)
+data_reg_imp <- predict(knn_reg_model, data)
+finaltestdata_reg_imp <- predict(knn_reg_model, testdata)
+rm(testdata)
+```
+
+
+### Create label of proportion default * 100 so that linear model won't be so compressed; split data for regression into train and test
+
+```{r}
+inputdata %>% filter(no_def=="0") -> data
+data_reg_labels <- (data[ ,763]*100)
+data <- as.matrix(data_reg_imp)
+```
+
+
+```{r}
+set.seed(789)
+index_fulltrain_reg <- createDataPartition(y=data_reg_labels, p=0.8, groups=4)
+data_train_reg <- data[as.numeric(index_fulltrain_reg[[1]]), ]
+data_train_reg_labels <- data_reg_labels[as.numeric(index_fulltrain_reg[[1]])]
+data_test_reg <- data[-as.numeric(index_fulltrain_reg[[1]]), ]
+data_test_reg_labels <- data_reg_labels[-as.numeric(index_fulltrain_reg[[1]])]
+```
+
+### Create reuseable folds for regression data and crossvalidate to determine optimal value for alpha
+
+```{r}
+set.seed(789)
+reg_folds <- createFolds(data_train_labels, k=4, list=FALSE)
+reg_cva <- cva.glmnet(data_train, data_train_labels, foldid=reg_folds, alpha=c(0.7,0.75,0.8,0.85,0.9,0.95,0.975,0.98,0.985,0.99,0.995,1), standardize=FALSE, family="gaussian", type.measure="mae", nlambda=200)
+minlossplot(reg_cva)
+```
+
+### Cross validate to determine optimal value for lambda
+
+```{r}
+reg_cv <- cv.glmnet(data_train, data_train_labels, foldid=reg_folds, alpha=1, standardize=FALSE, family="gaussian", type.measure="mae", nlambda=200)
+reg_cv$lambda.min
+i_reg_lam_min <- which(reg_cv$lambda == reg_cv$lambda.min)
+reg_min_mae <- reg_cv$cvm[i_reg_lam_min]
+reg_min_mae
+```
+
+### Predict test data and calc L1 norm and mae on test data
+
+```{r}
+reg_test_predictions <- predict(reg_cv, newx=data_test, s="lambda.min", type="response")
+summary(reg_test_predictions)
+```
+
+
+```{r}
+sum(abs(coef(reg_cv, s="lambda.min")))
+reg_test_mae <- mean(abs(reg_test_predictions-data_test_labels))
+reg_test_mae
+```
+
+
+
+
+
+
+
+
